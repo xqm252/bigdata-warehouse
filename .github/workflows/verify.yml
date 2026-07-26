@@ -16,167 +16,151 @@ jobs:
       - name: 检出代码
         uses: actions/checkout@v4
 
-      # ==================== 1. 启动集群 ====================
       - name: 启动集群
         run: |
-          docker compose up -d
-          echo "等待 Hadoop 就绪..."
-          for i in $(seq 1 30); do
-            if docker exec namenode hdfs dfs -ls / 2>/dev/null; then
-              echo "✓ HDFS 就绪"
-              break
-            fi
-            sleep 5
-          done
+          echo "=== 拉取镜像并启动 ==="
+          docker compose up -d 2>&1
+          echo ""
+          echo "=== 等待 30s 让容器初始化 ==="
+          sleep 30
+          echo ""
+          echo "=== 容器状态 ==="
+          docker compose ps -a
+          echo ""
+          # 诊断：打印所有容器的日志
+          echo "=== namenode 日志(最近10行) ==="
+          docker logs namenode --tail=10 2>&1 || echo "(无)"
+          echo "=== datanode 日志(最近10行) ==="
+          docker logs datanode --tail=10 2>&1 || echo "(无)"
+          echo "=== hive-metastore-postgresql 日志(最近10行) ==="
+          docker logs hive-metastore-postgresql --tail=10 2>&1 || echo "(无)"
+          echo "=== hive-metastore 日志(最近10行) ==="
+          docker logs hive-metastore --tail=10 2>&1 || echo "(无)"
+          echo "=== hive-server 日志(最近20行) ==="
+          docker logs hive-server --tail=20 2>&1 || echo "(无)"
 
-          echo "等待 Hive Metastore 就绪..."
-          for i in $(seq 1 30); do
-            if docker exec hive-metastore bash -c "echo > /dev/tcp/localhost/9083" 2>/dev/null; then
-              echo "✓ Hive Metastore 就绪"
-              break
-            fi
-            sleep 5
-          done
+          # 如果 hive-server 不存在，尝试单独启动
+          if ! docker ps --format '{{.Names}}' | grep -q "hive-server"; then
+            echo ""
+            echo "!!! hive-server 未运行，尝试重新启动..."
+            docker compose up -d hive-metastore-postgresql 2>&1
+            sleep 10
+            docker compose up -d hive-metastore 2>&1
+            sleep 10
+            docker compose up -d hive-server 2>&1
+            sleep 20
+            docker compose ps -a
+          fi
 
-          echo "等待 HiveServer2 就绪..."
+      - name: 等待 HiveServer2 就绪
+        run: |
+          echo "等待 HiveServer2 接受连接..."
           for i in $(seq 1 60); do
+            # 先确认容器在运行
+            if ! docker ps --format '{{.Names}}' | grep -q "hive-server"; then
+              echo "✗ hive-server 容器不存在!"
+              docker compose ps -a
+              exit 1
+            fi
             if docker exec hive-server beeline -u jdbc:hive2://localhost:10000 -e "show databases;" 2>&1 | grep -q "database_name"; then
               echo "✓ HiveServer2 就绪 (尝试 $i 次)"
-              break
+              exit 0
             fi
-            if [ $((i % 5)) -eq 0 ]; then
+            if [ $((i % 6)) -eq 0 ]; then
               echo "  等待中... ($i/60)"
             fi
             sleep 5
           done
+          echo "✗ HiveServer2 超时未就绪"
+          echo "=== hive-server 完整日志 ==="
+          docker logs hive-server 2>&1 || true
+          exit 1
 
-          # 最终确认
-          docker compose ps
-          docker exec hive-server beeline -u jdbc:hive2://localhost:10000 -e "show databases;" 2>&1
-
-      # ==================== 2. 生成数据 ====================
       - name: 生成模拟数据
         run: |
           mkdir -p data logs
           python3 scripts/generate_mock_data.py
           ls -lh data/
 
-      # ==================== 3. ODS 层 ====================
       - name: "ETL: ODS 贴源层"
         run: |
           DT="2026-07-26"
-
           echo "=== ODS 建表 ==="
           for f in sql/ods/ods_category.sql sql/ods/ods_user.sql sql/ods/ods_product.sql sql/ods/ods_order.sql; do
             echo "执行: $f"
-            docker exec hive-server beeline -u jdbc:hive2://localhost:10000 -f "/opt/$f" 2>&1 | grep -v "SLF4J\|Connecting\|Connected"
+            docker exec hive-server beeline -u jdbc:hive2://localhost:10000 -f "/opt/$f" 2>&1 | grep -v "SLF4J\|Connecting\|Connected\|Loaded"
           done
 
-          echo ""
-          echo "=== 去表头 + 加载数据 ==="
+          echo "=== 去表头 ==="
           docker exec hive-server bash -c "
             for f in /opt/data/biz_*.csv; do
               base=\$(basename \$f .csv)
               tail -n +2 \$f > /opt/data/\${base}_nohead.csv
-              echo \"去表头: \${base}_nohead.csv (\$(wc -l < /opt/data/\${base}_nohead.csv) 行)\"
+              echo \"  \${base}_nohead.csv: \$(wc -l < /opt/data/\${base}_nohead.csv) 行\"
             done
           "
 
+          echo "=== LOAD DATA ==="
           for tbl in category user product order; do
             echo "加载 ods_$tbl..."
             docker exec hive-server beeline -u jdbc:hive2://localhost:10000 \
-              -e "LOAD DATA LOCAL INPATH '/opt/data/biz_${tbl}_nohead.csv' INTO TABLE ods.ods_${tbl} PARTITION (dt='${DT}')" 2>&1 | grep -v "SLF4J\|Connecting\|Connected"
+              -e "LOAD DATA LOCAL INPATH '/opt/data/biz_${tbl}_nohead.csv' INTO TABLE ods.ods_${tbl} PARTITION (dt='${DT}')" 2>&1 | grep -v "SLF4J\|Connecting\|Connected\|Loaded"
           done
 
-          echo ""
-          echo "=== ODS 验证 ==="
+          echo "=== 验证 ==="
           docker exec hive-server beeline -u jdbc:hive2://localhost:10000 --outputformat=csv2 \
             -e "SELECT 'ods_category', COUNT(*) FROM ods.ods_category
                 UNION ALL SELECT 'ods_user', COUNT(*) FROM ods.ods_user
                 UNION ALL SELECT 'ods_product', COUNT(*) FROM ods.ods_product
                 UNION ALL SELECT 'ods_order', COUNT(*) FROM ods.ods_order;" 2>&1 | grep -v "SLF4J"
+          echo "✓ ODS 完成"
 
-          echo "✓ ODS 层完成"
-
-      # ==================== 4. DWD 维度 ====================
-      - name: "ETL: DWD 明细层 — 维度表"
+      - name: "ETL: DWD 明细层"
         run: |
           DT="2026-07-26"
-
-          echo "=== DWD 维度 DDL ==="
-          for f in sql/dwd/dwd_dim_category.sql sql/dwd/dwd_dim_user.sql sql/dwd/dwd_dim_product.sql; do
-            docker exec hive-server beeline -u jdbc:hive2://localhost:10000 -f "/opt/$f" 2>&1 | grep -v "SLF4J\|Connecting\|Connected\|Loaded"
+          echo "=== DWD DDL ==="
+          for f in dwd_dim_category dwd_dim_user dwd_dim_product dwd_fact_order; do
+            docker exec hive-server beeline -u jdbc:hive2://localhost:10000 \
+              -f "/opt/sql/dwd/${f}.sql" 2>&1 | grep -v "SLF4J\|Connecting\|Connected\|Loaded"
           done
 
-          echo "=== DWD 维度 ETL ==="
-          for f in etl_dim_category etl_dim_user etl_dim_product; do
+          echo "=== DWD ETL ==="
+          for f in etl_dim_category etl_dim_user etl_dim_product etl_fact_order; do
             echo "执行: $f"
             docker exec hive-server beeline -u jdbc:hive2://localhost:10000 \
-              --hivevar dt="${DT}" -f "/opt/sql/dwd/${f}.sql" 2>&1 | grep -v "SLF4J\|Connecting\|Connected\|Loaded"
+              --hivevar dt="${DT}" -f "/opt/sql/dwd/${f}.sql" 2>&1 | grep -v "SLF4J\|Connecting\|Connected\|Loaded\|SLF4J"
           done
 
-          echo "✓ DWD 维度完成"
-
-      # ==================== 5. DWD 事实 ====================
-      - name: "ETL: DWD 明细层 — 事实表"
-        run: |
-          DT="2026-07-26"
-
-          echo "=== DWD 事实 DDL ==="
-          docker exec hive-server beeline -u jdbc:hive2://localhost:10000 -f /opt/sql/dwd/dwd_fact_order.sql 2>&1 | grep -v "SLF4J\|Connecting\|Connected"
-
-          echo "=== DWD 事实 ETL ==="
-          docker exec hive-server beeline -u jdbc:hive2://localhost:10000 \
-            --hivevar dt="${DT}" -f /opt/sql/dwd/etl_fact_order.sql 2>&1 | grep -v "SLF4J\|Connecting\|Connected\|Loaded"
-
-          echo ""
-          echo "=== DWD 验证 ==="
+          echo "=== 验证 ==="
           docker exec hive-server beeline -u jdbc:hive2://localhost:10000 --outputformat=csv2 \
             -e "SELECT 'dwd_dim_user', COUNT(*) FROM dwd.dwd_dim_user
                 UNION ALL SELECT 'dwd_dim_product', COUNT(*) FROM dwd.dwd_dim_product
                 UNION ALL SELECT 'dwd_dim_category', COUNT(*) FROM dwd.dwd_dim_category
                 UNION ALL SELECT 'dwd_fact_order', COUNT(*) FROM dwd.dwd_fact_order;" 2>&1 | grep -v "SLF4J"
+          echo "✓ DWD 完成"
 
-          echo "✓ DWD 事实完成"
-
-      # ==================== 6. DWS 层 ====================
-      - name: "ETL: DWS 汇总层"
+      - name: "ETL: DWS + ADS"
         run: |
           DT="2026-07-26"
+          echo "=== DWS 汇总 ==="
+          docker exec hive-server beeline -u jdbc:hive2://localhost:10000 \
+            --hivevar dt="${DT}" -f /opt/sql/dws/dws_user_daily_summary.sql 2>&1 | grep -v "SLF4J\|Connecting\|Connected\|Loaded"
+          docker exec hive-server beeline -u jdbc:hive2://localhost:10000 \
+            --hivevar dt="${DT}" -f /opt/sql/dws/dws_product_daily_sales.sql 2>&1 | grep -v "SLF4J\|Connecting\|Connected\|Loaded"
 
-          for f in sql/dws/dws_user_daily_summary.sql sql/dws/dws_product_daily_sales.sql; do
-            echo "执行: $f"
-            docker exec hive-server beeline -u jdbc:hive2://localhost:10000 \
-              --hivevar dt="${DT}" -f "/opt/$f" 2>&1 | grep -v "SLF4J\|Connecting\|Connected\|Loaded"
-          done
-
-          echo ""
-          echo "=== DWS 验证 ==="
-          docker exec hive-server beeline -u jdbc:hive2://localhost:10000 --outputformat=csv2 \
-            -e "SELECT 'dws_user_daily', COUNT(*) FROM dws.dws_user_daily_summary
-                UNION ALL SELECT 'dws_product_daily', COUNT(*) FROM dws.dws_product_daily_sales;" 2>&1 | grep -v "SLF4J"
-
-          echo "✓ DWS 层完成"
-
-      # ==================== 7. ADS 层 ====================
-      - name: "ETL: ADS 应用层 KPI"
-        run: |
-          DT="2026-07-26"
-
+          echo "=== ADS KPI ==="
           docker exec hive-server beeline -u jdbc:hive2://localhost:10000 \
             --hivevar dt="${DT}" -f /opt/sql/ads/ads_daily_kpi.sql 2>&1 | grep -v "SLF4J\|Connecting\|Connected\|Loaded"
 
           echo ""
-          echo "=== ADS KPI 结果 ==="
+          echo "=== 最终 KPI ==="
           docker exec hive-server beeline -u jdbc:hive2://localhost:10000 --outputformat=csv2 \
             -e "SELECT * FROM ads.ads_daily_kpi;" 2>&1 | grep -v "SLF4J"
-
           echo ""
-          echo "╔══════════════════════════════════════════════╗"
-          echo "║  ✓ 全链路 ETL 验证通过!                      ║"
-          echo "╚══════════════════════════════════════════════╝"
+          echo "╔══════════════════════════════════════════╗"
+          echo "║  ✓ 全链路 ETL 验证通过!                 ║"
+          echo "╚══════════════════════════════════════════╝"
 
-      # ==================== 8. 导出 ====================
       - name: 导出日志
         if: always()
         run: |
