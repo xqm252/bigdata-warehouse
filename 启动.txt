@@ -1,0 +1,19 @@
+ GitHub Actions 已经自动开始运行了。你可以：
+
+  1. 打开 https://github.com/xqm252/bigdata-warehouse/actions
+  2. 点击 数仓ETL验证 这个 workflow，查看实时进度
+  3. 预计 5-10 分钟跑完，所有步骤变绿 ✅
+
+  整个流程是：
+  拉 Docker 镜像 → 启动 Hadoop+Hive → 生成模拟数据 → ODS建表
+  → DWD维度建模 → DWS汇总 → ADS指标 → 验证数据量 → 导出日志
+
+  等跑完之后，你 README 里的那个 badge 会从灰色变成绿色，面试官点进仓库第一眼就能看到"这个项目是能跑通的"。
+
+  ---
+  推送上去的内容：
+  - 23 个文件，1816 行代码
+  - 完整的 ODS→DWD→DWS→ADS 四层 SQL
+  - SCD Type 2 缓慢变化维度实现
+  - Docker Compose 一键部署
+  - GitHub Actions 自动验证

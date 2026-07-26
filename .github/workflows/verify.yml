@@ -29,12 +29,12 @@ jobs:
       # ==================== 2. 启动 Hadoop + Hive 集群 ====================
       - name: 启动大数据集群
         run: |
-          docker-compose up -d
+          docker compose up -d
           echo "等待服务启动..."
           # 等待所有容器健康
           for i in $(seq 1 30); do
             echo "检查服务状态 (尝试 $i/30)..."
-            docker-compose ps
+            docker compose ps
             # 检查 HiveServer2 是否就绪
             if docker exec hive-server beeline -u jdbc:hive2://localhost:10000 -e "show databases;" 2>&1 | grep -q "OK"; then
               echo "✓ 集群启动成功!"
@@ -43,7 +43,7 @@ jobs:
             sleep 10
           done
           # 最终检查
-          docker-compose ps
+          docker compose ps
 
       # ==================== 3. 准备数据 ====================
       - name: 生成模拟数据
@@ -196,7 +196,7 @@ jobs:
       - name: 导出运行日志
         if: always()
         run: |
-          docker-compose logs --tail=200 > logs/docker-compose.log 2>/dev/null || true
+          docker compose logs --tail=200 > logs/docker compose.log 2>/dev/null || true
           docker logs hive-server --tail=100 > logs/hive-server.log 2>/dev/null || true
 
       - name: 上传日志
@@ -211,4 +211,4 @@ jobs:
       - name: 清理集群
         if: always()
         run: |
-          docker-compose down -v
+          docker compose down -v
