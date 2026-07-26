@@ -20,17 +20,21 @@ jobs:
       - name: 启动 Hadoop + Hive 集群
         run: |
           docker compose up -d
-          echo "等待服务启动..."
-          for i in $(seq 1 30); do
-            echo "检查服务状态 (尝试 $i/30)..."
-            docker compose ps
-            if docker exec hive-server beeline -u jdbc:hive2://localhost:10000 -e "show databases;" 2>&1 | grep -q "OK"; then
-              echo "✓ 集群启动成功!"
+          echo "等待 HiveServer2 就绪..."
+          for i in $(seq 1 45); do
+            echo "检查 ($i/45)..."
+            docker compose ps --format 'table {{.Name}}\t{{.Status}}'
+            if docker exec hive-server beeline -u jdbc:hive2://localhost:10000 -e "show databases;" 2>&1 | grep -q "database_name"; then
+              echo "✓ HiveServer2 就绪!"
               break
+            fi
+            # 如果 hive-server 挂了，看日志
+            if [ $((i % 10)) -eq 0 ]; then
+              echo "--- hive-server 最近日志 ---"
+              docker logs hive-server --tail=20 2>&1 || true
             fi
             sleep 10
           done
-          docker compose ps
 
       # ==================== 2. 生成模拟数据 ====================
       - name: 生成模拟数据
@@ -46,31 +50,40 @@ jobs:
           DT="2026-07-26"
           echo "========== ODS 建表 =========="
 
-          # 逐个文件执行，因为需要知道文件名
+          # beeline 重试函数（HiveServer2 可能短暂不可用）
+          beeline_retry() {
+            local max_retry=3
+            for i in $(seq 1 $max_retry); do
+              if docker exec hive-server beeline -u jdbc:hive2://localhost:10000 "$@" 2>&1; then
+                return 0
+              fi
+              echo "  beeline 失败，重试 ($i/$max_retry)..."
+              sleep 5
+            done
+            return 1
+          }
+
           for sql_file in sql/ods/ods_category.sql sql/ods/ods_user.sql sql/ods/ods_product.sql sql/ods/ods_order.sql; do
             echo "执行: $sql_file"
-            docker exec hive-server beeline -u jdbc:hive2://localhost:10000 -f "/opt/$sql_file" 2>&1 | tail -5
+            beeline_retry -f "/opt/$sql_file" | tail -5
           done
 
           echo ""
           echo "========== ODS 加载数据 =========="
 
-          # CSV 文件有表头，先用 tail 去掉表头再加载
-          docker exec hive-server bash -c "tail -n +2 /opt/data/biz_category.csv > /opt/data/tmp.csv && \
-            beeline -u jdbc:hive2://localhost:10000 \
-            -e \"LOAD DATA LOCAL INPATH '/opt/data/tmp.csv' INTO TABLE ods.ods_category PARTITION (dt='${DT}')\" 2>&1" | tail -5
+          # 先统一去掉所有 CSV 的表头（在 hive-server 容器内执行）
+          docker exec hive-server bash -c "
+            for f in /opt/data/biz_*.csv; do
+              tail -n +2 \$f > \${f%.csv}_nohead.csv
+              echo \"去表头: \$(basename \$f) → \$(basename \${f%.csv}_nohead.csv) (\$(wc -l < \${f%.csv}_nohead.csv) 行)\"
+            done
+          "
 
-          docker exec hive-server bash -c "tail -n +2 /opt/data/biz_user.csv > /opt/data/tmp.csv && \
-            beeline -u jdbc:hive2://localhost:10000 \
-            -e \"LOAD DATA LOCAL INPATH '/opt/data/tmp.csv' INTO TABLE ods.ods_user PARTITION (dt='${DT}')\" 2>&1" | tail -5
-
-          docker exec hive-server bash -c "tail -n +2 /opt/data/biz_product.csv > /opt/data/tmp.csv && \
-            beeline -u jdbc:hive2://localhost:10000 \
-            -e \"LOAD DATA LOCAL INPATH '/opt/data/tmp.csv' INTO TABLE ods.ods_product PARTITION (dt='${DT}')\" 2>&1" | tail -5
-
-          docker exec hive-server bash -c "tail -n +2 /opt/data/biz_order.csv > /opt/data/tmp.csv && \
-            beeline -u jdbc:hive2://localhost:10000 \
-            -e \"LOAD DATA LOCAL INPATH '/opt/data/tmp.csv' INTO TABLE ods.ods_order PARTITION (dt='${DT}')\" 2>&1" | tail -5
+          # 加载无表头 CSV 到 ODS 表
+          beeline_retry -e "LOAD DATA LOCAL INPATH '/opt/data/biz_category_nohead.csv' INTO TABLE ods.ods_category PARTITION (dt='${DT}')" | tail -5
+          beeline_retry -e "LOAD DATA LOCAL INPATH '/opt/data/biz_user_nohead.csv' INTO TABLE ods.ods_user PARTITION (dt='${DT}')" | tail -5
+          beeline_retry -e "LOAD DATA LOCAL INPATH '/opt/data/biz_product_nohead.csv' INTO TABLE ods.ods_product PARTITION (dt='${DT}')" | tail -5
+          beeline_retry -e "LOAD DATA LOCAL INPATH '/opt/data/biz_order_nohead.csv' INTO TABLE ods.ods_order PARTITION (dt='${DT}')" | tail -5
 
           echo ""
           echo "========== ODS 数据验证 =========="
