@@ -36,9 +36,9 @@ SELECT
     SUM(CASE WHEN order_status IN (2, 3, 4) THEN 1 ELSE 0 END) AS pay_cnt,
     SUM(CASE WHEN order_status IN (2, 3, 4) THEN order_amount ELSE 0 END) AS pay_amount,
     SUM(CASE WHEN order_status = 5 THEN 1 ELSE 0 END) AS cancel_cnt,
-    -- 从历史所有数据中取最早/最晚下单日期
-    MIN(dt) OVER (PARTITION BY user_sk) AS first_order_date,
-    MAX(dt) OVER (PARTITION BY user_sk) AS last_order_date
+    -- 历史首单/末单日期（首次加载时 = 当天，后续需跨分区查询更新）
+    CAST(MIN(create_time) AS STRING) AS first_order_date,
+    CAST(MAX(create_time) AS STRING) AS last_order_date
 FROM dwd.dwd_fact_order
 WHERE dt = '${dt}'
 GROUP BY user_sk;
