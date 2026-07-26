@@ -16,79 +16,83 @@ jobs:
       - name: 检出代码
         uses: actions/checkout@v4
 
-      - name: 启动集群
+      # ==================== 逐个启动，避免竞态 ====================
+      - name: 启动集群（逐个启动）
         run: |
-          echo "=== 拉取镜像并启动 ==="
-          docker compose up -d 2>&1
-          echo ""
-          echo "=== 等待 30s 让容器初始化 ==="
-          sleep 30
-          echo ""
-          echo "=== 容器状态 ==="
-          docker compose ps -a
-          echo ""
-          # 诊断：打印所有容器的日志
-          echo "=== namenode 日志(最近10行) ==="
-          docker logs namenode --tail=10 2>&1 || echo "(无)"
-          echo "=== datanode 日志(最近10行) ==="
-          docker logs datanode --tail=10 2>&1 || echo "(无)"
-          echo "=== hive-metastore-postgresql 日志(最近10行) ==="
-          docker logs hive-metastore-postgresql --tail=10 2>&1 || echo "(无)"
-          echo "=== hive-metastore 日志(最近10行) ==="
-          docker logs hive-metastore --tail=10 2>&1 || echo "(无)"
-          echo "=== hive-server 日志(最近20行) ==="
-          docker logs hive-server --tail=20 2>&1 || echo "(无)"
-
-          # 如果 hive-server 不存在，尝试单独启动
-          if ! docker ps --format '{{.Names}}' | grep -q "hive-server"; then
-            echo ""
-            echo "!!! hive-server 未运行，尝试重新启动..."
-            docker compose up -d hive-metastore-postgresql 2>&1
-            sleep 10
-            docker compose up -d hive-metastore 2>&1
-            sleep 10
-            docker compose up -d hive-server 2>&1
-            sleep 20
-            docker compose ps -a
-          fi
-
-      - name: 等待 HiveServer2 就绪
-        run: |
-          echo "等待 HiveServer2 接受连接..."
-          for i in $(seq 1 60); do
-            # 先确认容器在运行
-            if ! docker ps --format '{{.Names}}' | grep -q "hive-server"; then
-              echo "✗ hive-server 容器不存在!"
-              docker compose ps -a
-              exit 1
+          echo "=== 1/5 启动 namenode ==="
+          docker compose up -d namenode
+          for i in $(seq 1 30); do
+            if docker exec namenode hdfs dfsadmin -safemode get 2>&1 | grep -q "Safe mode is OFF"; then
+              echo "✓ namenode 就绪 (safe mode OFF)"
+              break
             fi
-            if docker exec hive-server beeline -u jdbc:hive2://localhost:10000 -e "show databases;" 2>&1 | grep -q "database_name"; then
-              echo "✓ HiveServer2 就绪 (尝试 $i 次)"
-              exit 0
+            echo "  等待 namenode 退出安全模式... ($i/30)"
+            sleep 5
+          done
+
+          echo "=== 2/5 启动 datanode ==="
+          docker compose up -d datanode
+          sleep 15
+          # 验证 datanode 注册成功
+          docker exec namenode hdfs dfsadmin -report 2>&1 | grep -E "Live datanodes|Datanodes available" || echo "  (等待 datanode 注册...)"
+
+          echo "=== 3/5 启动 PostgreSQL ==="
+          docker compose up -d hive-metastore-postgresql
+          for i in $(seq 1 20); do
+            if docker exec hive-metastore-postgresql pg_isready -U hive 2>&1 | grep -q "accepting"; then
+              echo "✓ PostgreSQL 就绪"
+              break
             fi
-            if [ $((i % 6)) -eq 0 ]; then
-              echo "  等待中... ($i/60)"
+            sleep 3
+          done
+
+          echo "=== 4/5 启动 Hive Metastore ==="
+          docker compose up -d hive-metastore
+          for i in $(seq 1 30); do
+            if docker logs hive-metastore 2>&1 | grep -q "Starting hive metastore"; then
+              echo "✓ Hive Metastore 已启动"
+              break
             fi
             sleep 5
           done
-          echo "✗ HiveServer2 超时未就绪"
-          echo "=== hive-server 完整日志 ==="
-          docker logs hive-server 2>&1 || true
-          exit 1
 
+          echo "=== 5/5 启动 HiveServer2 ==="
+          docker compose up -d hive-server
+          echo "等待 HiveServer2 接受 JDBC 连接..."
+          for i in $(seq 1 60); do
+            if docker exec hive-server beeline -u jdbc:hive2://localhost:10000 -e "show databases;" 2>&1 | grep -q "database_name"; then
+              echo "✓ HiveServer2 就绪! (尝试 $i 次)"
+              break
+            fi
+            if [ $((i % 10)) -eq 0 ]; then
+              echo "  等待中... ($i/60)"
+              # 每10次看看 hive-metastore 还在不在
+              docker logs hive-metastore --tail=3 2>&1 || true
+            fi
+            sleep 5
+          done
+
+          echo ""
+          echo "=== 最终状态 ==="
+          docker compose ps -a
+          docker exec hive-server beeline -u jdbc:hive2://localhost:10000 -e "show databases;" 2>&1 | grep -v "SLF4J"
+
+      # ==================== 生成数据 ====================
       - name: 生成模拟数据
         run: |
           mkdir -p data logs
           python3 scripts/generate_mock_data.py
           ls -lh data/
 
+      # ==================== ODS ====================
       - name: "ETL: ODS 贴源层"
         run: |
           DT="2026-07-26"
           echo "=== ODS 建表 ==="
-          for f in sql/ods/ods_category.sql sql/ods/ods_user.sql sql/ods/ods_product.sql sql/ods/ods_order.sql; do
+          for f in ods_category ods_user ods_product ods_order; do
             echo "执行: $f"
-            docker exec hive-server beeline -u jdbc:hive2://localhost:10000 -f "/opt/$f" 2>&1 | grep -v "SLF4J\|Connecting\|Connected\|Loaded"
+            docker exec hive-server beeline -u jdbc:hive2://localhost:10000 \
+              -f "/opt/sql/ods/${f}.sql" 2>&1 | grep -v "SLF4J\|Connecting\|Connected\|Loaded"
           done
 
           echo "=== 去表头 ==="
@@ -115,6 +119,7 @@ jobs:
                 UNION ALL SELECT 'ods_order', COUNT(*) FROM ods.ods_order;" 2>&1 | grep -v "SLF4J"
           echo "✓ ODS 完成"
 
+      # ==================== DWD ====================
       - name: "ETL: DWD 明细层"
         run: |
           DT="2026-07-26"
@@ -128,7 +133,7 @@ jobs:
           for f in etl_dim_category etl_dim_user etl_dim_product etl_fact_order; do
             echo "执行: $f"
             docker exec hive-server beeline -u jdbc:hive2://localhost:10000 \
-              --hivevar dt="${DT}" -f "/opt/sql/dwd/${f}.sql" 2>&1 | grep -v "SLF4J\|Connecting\|Connected\|Loaded\|SLF4J"
+              --hivevar dt="${DT}" -f "/opt/sql/dwd/${f}.sql" 2>&1 | grep -v "SLF4J\|Connecting\|Connected\|Loaded"
           done
 
           echo "=== 验证 ==="
@@ -139,7 +144,8 @@ jobs:
                 UNION ALL SELECT 'dwd_fact_order', COUNT(*) FROM dwd.dwd_fact_order;" 2>&1 | grep -v "SLF4J"
           echo "✓ DWD 完成"
 
-      - name: "ETL: DWS + ADS"
+      # ==================== DWS + ADS ====================
+      - name: "ETL: DWS + ADS 应用层"
         run: |
           DT="2026-07-26"
           echo "=== DWS 汇总 ==="
@@ -148,12 +154,15 @@ jobs:
           docker exec hive-server beeline -u jdbc:hive2://localhost:10000 \
             --hivevar dt="${DT}" -f /opt/sql/dws/dws_product_daily_sales.sql 2>&1 | grep -v "SLF4J\|Connecting\|Connected\|Loaded"
 
+          echo ""
           echo "=== ADS KPI ==="
           docker exec hive-server beeline -u jdbc:hive2://localhost:10000 \
             --hivevar dt="${DT}" -f /opt/sql/ads/ads_daily_kpi.sql 2>&1 | grep -v "SLF4J\|Connecting\|Connected\|Loaded"
 
           echo ""
-          echo "=== 最终 KPI ==="
+          echo "╔══════════════════════════════════════════╗"
+          echo "║        最终 KPI 结果                      ║"
+          echo "╚══════════════════════════════════════════╝"
           docker exec hive-server beeline -u jdbc:hive2://localhost:10000 --outputformat=csv2 \
             -e "SELECT * FROM ads.ads_daily_kpi;" 2>&1 | grep -v "SLF4J"
           echo ""
@@ -165,7 +174,6 @@ jobs:
         if: always()
         run: |
           docker compose logs --tail=200 > logs/docker-compose.log 2>/dev/null || true
-          docker logs hive-server --tail=100 > logs/hive-server.log 2>/dev/null || true
 
       - name: 上传日志
         if: always()
