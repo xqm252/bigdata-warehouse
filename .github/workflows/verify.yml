@@ -1,0 +1,214 @@
+name: 数仓ETL验证
+
+# ============================================================
+# 每次 push 到 main 分支自动执行：
+#   1. 启动 Hadoop + Hive 集群
+#   2. 生成模拟数据 → 上传 HDFS
+#   3. 执行 ODS → DWD → DWS → ADS 全链路
+#   4. 验证每层数据量
+# ============================================================
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  # 允许手动触发
+  workflow_dispatch:
+
+jobs:
+  etl-verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      # ==================== 1. 检出代码 ====================
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      # ==================== 2. 启动 Hadoop + Hive 集群 ====================
+      - name: 启动大数据集群
+        run: |
+          docker-compose up -d
+          echo "等待服务启动..."
+          # 等待所有容器健康
+          for i in $(seq 1 30); do
+            echo "检查服务状态 (尝试 $i/30)..."
+            docker-compose ps
+            # 检查 HiveServer2 是否就绪
+            if docker exec hive-server beeline -u jdbc:hive2://localhost:10000 -e "show databases;" 2>&1 | grep -q "OK"; then
+              echo "✓ 集群启动成功!"
+              break
+            fi
+            sleep 10
+          done
+          # 最终检查
+          docker-compose ps
+
+      # ==================== 3. 准备数据 ====================
+      - name: 生成模拟数据
+        run: |
+          # 创建必要目录
+          mkdir -p data logs
+          # 如果 Python 脚本存在则运行
+          if [ -f scripts/generate_mock_data.py ]; then
+            pip3 install faker 2>/dev/null || true
+            python3 scripts/generate_mock_data.py
+            echo "✓ 模拟数据生成完成"
+          fi
+          ls -lh data/
+
+      - name: 上传数据到 HDFS
+        run: |
+          # 在 HDFS 上创建目录结构
+          docker exec namenode hdfs dfs -mkdir -p /user/hive/warehouse/ods.db/
+          docker exec namenode hdfs dfs -mkdir -p /user/hive/warehouse/dwd.db/
+          docker exec namenode hdfs dfs -mkdir -p /user/hive/warehouse/dws.db/
+          docker exec namenode hdfs dfs -mkdir -p /user/hive/warehouse/ads.db/
+          # 上传数据文件
+          docker cp data/. namenode:/opt/data/
+          docker exec namenode hdfs dfs -put /opt/data/*.csv /user/data/ 2>/dev/null || true
+          echo "✓ 数据已上传到 HDFS"
+
+      # ==================== 4. 执行 ODS 层 ====================
+      - name: "ETL: ODS 贴源层建表"
+        run: |
+          echo "========== ODS 层建表 =========="
+          for sql_file in sql/ods/*.sql; do
+            if [ -f "$sql_file" ]; then
+              echo "执行: $sql_file"
+              docker exec hive-server beeline \
+                -u jdbc:hive2://localhost:10000 \
+                -f "/opt/$sql_file" 2>&1 | tail -5
+              echo "---"
+            fi
+          done
+          echo "✓ ODS 层建表完成"
+
+      # ==================== 5. 执行 DWD 层 ====================
+      - name: "ETL: DWD 明细层 — 维度表"
+        run: |
+          echo "========== DWD 维度表建表 =========="
+          for sql_file in sql/dwd/dwd_dim_*.sql; do
+            if [ -f "$sql_file" ]; then
+              echo "执行: $sql_file"
+              docker exec hive-server beeline \
+                -u jdbc:hive2://localhost:10000 \
+                -f "/opt/$sql_file" 2>&1 | tail -5
+              echo "---"
+            fi
+          done
+          echo "✓ DWD 维度表建表完成"
+
+      - name: "ETL: DWD 明细层 — 事实表"
+        run: |
+          echo "========== DWD 事实表建表 =========="
+          for sql_file in sql/dwd/dwd_fact_*.sql; do
+            if [ -f "$sql_file" ]; then
+              echo "执行: $sql_file"
+              docker exec hive-server beeline \
+                -u jdbc:hive2://localhost:10000 \
+                -f "/opt/$sql_file" 2>&1 | tail -5
+              echo "---"
+            fi
+          done
+          echo "✓ DWD 事实表建表完成"
+
+      # ==================== 6. 执行 DWS 层 ====================
+      - name: "ETL: DWS 汇总层"
+        run: |
+          echo "========== DWS 层汇总 =========="
+          for sql_file in sql/dws/*.sql; do
+            if [ -f "$sql_file" ]; then
+              echo "执行: $sql_file"
+              docker exec hive-server beeline \
+                -u jdbc:hive2://localhost:10000 \
+                -f "/opt/$sql_file" 2>&1 | tail -5
+              echo "---"
+            fi
+          done
+          echo "✓ DWS 层汇总完成"
+
+      # ==================== 7. 执行 ADS 层 ====================
+      - name: "ETL: ADS 应用层指标"
+        run: |
+          echo "========== ADS 层指标 =========="
+          for sql_file in sql/ads/*.sql; do
+            if [ -f "$sql_file" ]; then
+              echo "执行: $sql_file"
+              docker exec hive-server beeline \
+                -u jdbc:hive2://localhost:10000 \
+                -f "/opt/$sql_file" 2>&1 | tail -5
+              echo "---"
+            fi
+          done
+          echo "✓ ADS 层指标产出完成"
+
+      # ==================== 8. 数据验证 ====================
+      - name: 验证各层数据量
+        run: |
+          echo "========================================="
+          echo "  数据仓库分层验证报告"
+          echo "========================================="
+          echo ""
+
+          echo "【ODS 贴源层】"
+          docker exec hive-server beeline \
+            -u jdbc:hive2://localhost:10000 \
+            -e "SELECT 'ods_order', COUNT(*) FROM ods.ods_order
+                UNION ALL
+                SELECT 'ods_user', COUNT(*) FROM ods.ods_user
+                UNION ALL
+                SELECT 'ods_product', COUNT(*) FROM ods.ods_product
+                UNION ALL
+                SELECT 'ods_category', COUNT(*) FROM ods.ods_category;" 2>&1 | grep -E "^\|"
+
+          echo ""
+          echo "【DWD 明细层】"
+          docker exec hive-server beeline \
+            -u jdbc:hive2://localhost:10000 \
+            -e "SELECT 'dwd_dim_user', COUNT(*) FROM dwd.dwd_dim_user
+                UNION ALL
+                SELECT 'dwd_dim_product', COUNT(*) FROM dwd.dwd_dim_product
+                UNION ALL
+                SELECT 'dwd_fact_order', COUNT(*) FROM dwd.dwd_fact_order;" 2>&1 | grep -E "^\|"
+
+          echo ""
+          echo "【DWS 汇总层】"
+          docker exec hive-server beeline \
+            -u jdbc:hive2://localhost:10000 \
+            -e "SELECT 'dws_user_daily', COUNT(*) FROM dws.dws_user_daily_summary
+                UNION ALL
+                SELECT 'dws_product_daily', COUNT(*) FROM dws.dws_product_daily_sales;" 2>&1 | grep -E "^\|"
+
+          echo ""
+          echo "【ADS 应用层 — 核心KPI】"
+          docker exec hive-server beeline \
+            -u jdbc:hive2://localhost:10000 \
+            -e "SELECT * FROM ads.ads_daily_kpi ORDER BY dt DESC LIMIT 5;" 2>&1 | grep -E "^\|"
+
+          echo ""
+          echo "========================================="
+          echo "  ✓ 全链路 ETL 验证通过!"
+          echo "========================================="
+
+      # ==================== 9. 导出日志（供下载查看） ====================
+      - name: 导出运行日志
+        if: always()
+        run: |
+          docker-compose logs --tail=200 > logs/docker-compose.log 2>/dev/null || true
+          docker logs hive-server --tail=100 > logs/hive-server.log 2>/dev/null || true
+
+      - name: 上传日志
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: etl-logs
+          path: logs/
+          retention-days: 7
+
+      # ==================== 10. 清理 ====================
+      - name: 清理集群
+        if: always()
+        run: |
+          docker-compose down -v

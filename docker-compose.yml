@@ -1,0 +1,142 @@
+version: '3.8'
+
+# ============================================================
+# 电商数据仓库 — Hadoop + Hive 开发环境
+# 启动: docker-compose up -d
+# 停止: docker-compose down
+# Web UI:
+#   HDFS NameNode:  http://localhost:9870
+#   YARN ResourceManager: http://localhost:8088
+#   HiveServer2:    jdbc:hive2://localhost:10000
+# ============================================================
+
+services:
+  # ==================== Hadoop HDFS ====================
+  namenode:
+    image: bde2020/hadoop-namenode:2.0.0-hadoop3.2.1-java8
+    container_name: namenode
+    hostname: namenode
+    restart: unless-stopped
+    environment:
+      - CLUSTER_NAME=hadoop-cluster
+    env_file:
+      - ./docker/hadoop.env
+    ports:
+      - "9870:9870"
+      - "8020:8020"
+    volumes:
+      - hadoop_namenode:/hadoop/dfs/name
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9870"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+
+  datanode:
+    image: bde2020/hadoop-datanode:2.0.0-hadoop3.2.1-java8
+    container_name: datanode
+    hostname: datanode
+    restart: unless-stopped
+    environment:
+      - SERVICE_PRECONDITION=namenode:9870
+    env_file:
+      - ./docker/hadoop.env
+    volumes:
+      - hadoop_datanode:/hadoop/dfs/data
+    depends_on:
+      - namenode
+
+  resourcemanager:
+    image: bde2020/hadoop-resourcemanager:2.0.0-hadoop3.2.1-java8
+    container_name: resourcemanager
+    hostname: resourcemanager
+    restart: unless-stopped
+    environment:
+      - SERVICE_PRECONDITION=namenode:9870,datanode:9864
+    env_file:
+      - ./docker/hadoop.env
+    ports:
+      - "8088:8088"
+    depends_on:
+      - namenode
+      - datanode
+
+  nodemanager:
+    image: bde2020/hadoop-nodemanager:2.0.0-hadoop3.2.1-java8
+    container_name: nodemanager
+    hostname: nodemanager
+    restart: unless-stopped
+    environment:
+      - SERVICE_PRECONDITION=namenode:9870,datanode:9864,resourcemanager:8088
+    env_file:
+      - ./docker/hadoop.env
+    depends_on:
+      - resourcemanager
+
+  # ==================== Hive Metastore DB ====================
+  hive-metastore-postgresql:
+    image: postgres:9.6-alpine
+    container_name: hive-metastore-postgresql
+    restart: unless-stopped
+    environment:
+      - POSTGRES_DB=metastore
+      - POSTGRES_USER=hive
+      - POSTGRES_PASSWORD=hive
+    volumes:
+      - hive_pg_data:/var/lib/postgresql/data
+
+  # ==================== Hive ====================
+  hive-metastore:
+    image: bde2020/hive:2.3.2-postgresql-metastore
+    container_name: hive-metastore
+    hostname: hive-metastore
+    restart: unless-stopped
+    depends_on:
+      - namenode
+      - datanode
+      - hive-metastore-postgresql
+    env_file:
+      - ./docker/hadoop.env
+    environment:
+      - SERVICE_PRECONDITION=hive-metastore-postgresql:5432
+      - HIVE_SITE_CONF_javax_jdo_option_ConnectionURL=jdbc:postgresql://hive-metastore-postgresql/metastore
+      - HIVE_SITE_CONF_javax_jdo_option_ConnectionDriverName=org.postgresql.Driver
+      - HIVE_SITE_CONF_javax_jdo_option_ConnectionUserName=hive
+      - HIVE_SITE_CONF_javax_jdo_option_ConnectionPassword=hive
+    ports:
+      - "9083:9083"
+
+  hive-server:
+    image: bde2020/hive:2.3.2-postgresql-metastore
+    container_name: hive-server
+    hostname: hive-server
+    restart: unless-stopped
+    depends_on:
+      - hive-metastore
+    env_file:
+      - ./docker/hadoop.env
+    environment:
+      - HIVE_CORE_CONF_javax_jdo_option_ConnectionURL=jdbc:postgresql://hive-metastore-postgresql/metastore
+      - HIVE_CORE_CONF_javax_jdo_option_ConnectionDriverName=org.postgresql.Driver
+      - HIVE_CORE_CONF_javax_jdo_option_ConnectionUserName=hive
+      - HIVE_CORE_CONF_javax_jdo_option_ConnectionPassword=hive
+      - SERVICE_PRECONDITION=hive-metastore:9083
+    ports:
+      - "10000:10000"
+      - "10002:10002"
+    volumes:
+      - ./sql:/opt/sql
+      - ./scripts:/opt/scripts
+      - ./data:/opt/data
+      - ./logs:/opt/logs
+    healthcheck:
+      test: ["CMD", "bash", "-c", "beeline -u jdbc:hive2://localhost:10000 -e 'show databases;' 2>&1 | grep -q OK"]
+      interval: 20s
+      timeout: 15s
+      retries: 15
+      start_period: 60s
+
+volumes:
+  hadoop_namenode:
+  hadoop_datanode:
+  hive_pg_data:
